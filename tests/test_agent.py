@@ -48,3 +48,22 @@
 #
 #         # Ensures there are no function calls or other unexpected events
 #         result.expect.no_more_events()
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for the play_audio_file tool
+# ---------------------------------------------------------------------------
+
+from pathlib import Path
+
+from agent import Assistant
+
+
+async def test_play_audio_file_missing_returns_friendly_error(monkeypatch) -> None:
+    """音频文件缺失时返回友好提示，而不是抛出 FileNotFoundError。"""
+    monkeypatch.setattr(Path, "is_file", lambda self: False)
+
+    result = await Assistant().play_audio_file(None)
+
+    assert isinstance(result, str)
+    assert "unavailable" in result

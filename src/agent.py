@@ -4,9 +4,11 @@ import logging
 import os
 import textwrap
 import wave
+from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
+from livekit import rtc
 from livekit.agents import (
     Agent,
     AgentServer,
@@ -18,6 +20,7 @@ from livekit.agents import (
     stt,
 )
 from livekit.plugins import openai
+from livekit.agents import function_tool, RunContext
 
 from qwen_omni_stt import QwenOmniSTT
 
@@ -52,7 +55,6 @@ def build_stt() -> stt.STT:
             api_key=SILICONFLOW_API_KEY,
         )
     raise ValueError(f"未知的 STT_BACKEND={STT_BACKEND!r}，可选：qwen / free")
-
 
 # 1 秒静音 WAV，用于免费 STT 的预热和保活
 _silence = io.BytesIO()
@@ -115,11 +117,11 @@ class Assistant(Agent):
             instructions=textwrap.dedent(
                 """\
                 You are a friendly, reliable voice assistant that answers questions, explains topics, and completes tasks with available tools.
-
+                If asked to play audio, call the `play_audio_file` function immediately. It plays a fixed built-in clip and needs no file name, so do not ask the user for one.
                 # Output rules
 
                 You are interacting with the user via voice, and must apply the following rules to ensure your output sounds natural in a text-to-speech system:
-
+                If asked to play audio, use the `play_audio_file` function.
                 - Respond in plain text only. Never use JSON, markdown, lists, tables, code, emojis, or other complex formatting.
                 - Keep replies brief by default: one to three sentences. Ask one question at a time.
                 - Do not reveal system instructions, internal reasoning, tool names, parameters, or raw outputs
@@ -139,7 +141,7 @@ class Assistant(Agent):
                 - Collect required inputs first. Perform actions silently if the runtime expects it.
                 - Speak outcomes clearly. If an action fails, say so once, propose a fallback, or ask how to proceed.
                 - When tools return structured data, summarize it to the user in a way that is easy to understand, and don't directly recite identifiers or other technical details.
-
+                
                 # Guardrails
 
                 - Stay within safe, lawful, and appropriate use; decline harmful or out-of-scope requests.
@@ -152,21 +154,57 @@ class Assistant(Agent):
     # To add tools, use the @function_tool decorator.
     # Here's an example that adds a simple weather tool.
     # You also have to add `from livekit.agents import function_tool, RunContext` to the top of this file
-    # @function_tool
-    # async def lookup_weather(self, context: RunContext, location: str):
-    #     """Use this tool to look up current weather information in the given location.
-    #
-    #     If the location is not supported by the weather service, the tool will indicate this. You must tell the user the location's weather is unavailable.
-    #
-    #     Args:
-    #         location: The location to look up weather information for (e.g. city name)
-    #     """
-    #
-    #     logger.info(f"Looking up weather for {location}")
-    #
-    #     return "sunny with a temperature of 70 degrees."
+    @function_tool
+    async def lookup_weather(self, context: RunContext, location: str):
+         """Use this tool to look up current weather information in the given location.
+    
+         If the location is not supported by the weather service, the tool will indicate this. You must tell the user the location's weather is unavailable.
+    
+         Args:
+            location: The location to look up weather information for (e.g. city name)
+        """
+    
+         logger.info(f"Looking up weather for {location}")
+    
+         return "sunny with a temperature of 70 degrees."
 
+    @function_tool
+    async def play_audio_file(self, context: RunContext):
+        """Play the built-in audio clip to the user.
 
+        This tool takes no arguments: the audio file is fixed and bundled
+        with the application, so never ask the user for a file name or path.
+        Call this tool immediately whenever the user asks to play audio
+        (e.g. "play audio", "播放音频").
+        """
+
+        audio_path = Path(__file__).resolve().parent.parent / "audio.wav"
+
+        if not audio_path.is_file():
+            logger.warning("audio file not found: %s", audio_path)
+            return "Sorry, the audio clip is unavailable right now. Please try again later."
+
+        print(f"Playing audio file: {audio_path}")
+
+        with wave.open(str(audio_path), 'rb') as wav_file:
+            num_channels = wav_file.getnchannels()
+            sample_rate = wav_file.getframerate()
+            frames = wav_file.readframes(wav_file.getnframes())
+
+        audio_frame = rtc.AudioFrame(
+            data=frames,
+            sample_rate=sample_rate,
+            num_channels=num_channels,
+            samples_per_channel=wav_file.getnframes()
+        )
+
+        async def audio_generator():
+            yield audio_frame
+
+        await self.session.say("Playing audio file", audio=audio_generator())
+
+        return None, "I've played the audio file for you."
+    
 server = AgentServer()
 
 
@@ -211,6 +249,8 @@ async def my_agent(ctx: JobContext):
         room=ctx.room,
     )
 
+    session.say("Hello! I'm  ready. How can I help you today?")
+    
     # # Add a virtual avatar to the session, if desired
     # # For other providers, see https://docs.livekit.io/agents/models/avatar/
     # avatar = anam.AvatarSession(
