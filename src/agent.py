@@ -21,16 +21,19 @@ from livekit.agents import (
 )
 from livekit.plugins import openai
 from livekit.agents import function_tool, RunContext
-
+import mcp
 from qwen_omni_stt import QwenOmniSTT
 
 logger = logging.getLogger("agent")
-
 load_dotenv(".env.local")
 
 # 硅基流动 SiliconFlow：一个 API Key 同时提供 LLM / STT / TTS，OpenAI 兼容接口
 SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
 SILICONFLOW_API_KEY = os.environ["SILICONFLOW_API_KEY"]
+
+# 代理服务器配置
+LLMProxy_BASE_URL = "http://192.168.1.51:4000"
+LLMProxy_API_KEY ="sk-local-litellm-change-this"
 
 # STT 后端切换：
 #   qwen —— 收费的 Qwen3-Omni 多模态接口（走 chat/completions），稳定低延迟
@@ -55,7 +58,6 @@ def build_stt() -> stt.STT:
             api_key=SILICONFLOW_API_KEY,
         )
     raise ValueError(f"未知的 STT_BACKEND={STT_BACKEND!r}，可选：qwen / free")
-
 # 1 秒静音 WAV，用于免费 STT 的预热和保活
 _silence = io.BytesIO()
 with wave.open(_silence, "wb") as w:
@@ -64,7 +66,6 @@ with wave.open(_silence, "wb") as w:
     w.setframerate(16000)
     w.writeframes(b"\x00\x00" * 16000)
 _SILENCE_WAV = _silence.getvalue()
-
 
 async def _stt_ping(client: httpx.AsyncClient, timeout: float) -> None:
     resp = await client.post(
@@ -75,7 +76,6 @@ async def _stt_ping(client: httpx.AsyncClient, timeout: float) -> None:
         timeout=timeout,
     )
     resp.raise_for_status()
-
 
 async def _warmup_and_keepalive_free_stt() -> None:
     """免费 SenseVoiceSmall 实例冷启动慢且会被回收：启动预热，之后每 20s 保活。"""
@@ -103,8 +103,8 @@ class Assistant(Agent):
             # 选用非思考模型 Qwen2.5-7B-Instruct：Qwen3 的思考链会让语音回复延迟十几到几十秒
             llm=openai.LLM(
                 model="Qwen/Qwen2.5-7B-Instruct",
-                base_url=SILICONFLOW_BASE_URL,
-                api_key=SILICONFLOW_API_KEY,
+                base_url=LLMProxy_BASE_URL,
+                api_key=LLMProxy_API_KEY,
             ),
             # To use a realtime model instead of a voice pipeline, replace the LLM
             # with a RealtimeModel and remove the STT/TTS from the AgentSession
@@ -149,6 +149,14 @@ class Assistant(Agent):
                 - Protect privacy and minimize sensitive data.
                 """
             ),
+            tools=[
+                mcp.MCPToolset(
+                    id="my-mcp-server",
+                    mcp_server=mcp.MCPServerHTTP(
+                        "http://192.168.1.51:5103/mcp",
+                    ),
+                )
+            ],
         )
 
     # To add tools, use the @function_tool decorator.
