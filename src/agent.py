@@ -21,8 +21,15 @@ from livekit.agents import (
 )
 from livekit.plugins import openai
 from livekit.agents import function_tool, RunContext
-import mcp
 from qwen_omni_stt import QwenOmniSTT
+
+try:
+    from livekit.agents.mcp import MCPServerHTTP, MCPToolset
+except ImportError:
+    from livekit.agents import mcp
+
+    MCPServerHTTP = mcp.MCPServerHTTP
+    MCPToolset = mcp.MCPToolset
 
 logger = logging.getLogger("agent")
 load_dotenv(".env.local")
@@ -150,9 +157,9 @@ class Assistant(Agent):
                 """
             ),
             tools=[
-                mcp.MCPToolset(
+                MCPToolset(
                     id="my-mcp-server",
-                    mcp_server=mcp.MCPServerHTTP(
+                    mcp_server=MCPServerHTTP(
                         "http://192.168.1.51:5103/mcp",
                     ),
                 )
