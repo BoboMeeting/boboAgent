@@ -54,9 +54,26 @@
 # Unit tests for the play_audio_file tool
 # ---------------------------------------------------------------------------
 
+import json
 from pathlib import Path
 
-from agent import Assistant
+from agent import Assistant, summarize_tool_event
+
+
+def test_summarize_tool_event_includes_timing_and_payload():
+    """时间戳和工具参数应被结构化输出，便于诊断 MCP/LLM 交互延迟。"""
+    payload = summarize_tool_event(
+        direction="llm_to_mcp",
+        tool_name="search_documents",
+        arguments={"query": "会议纪要"},
+        elapsed_ms=321.5,
+    )
+
+    obj = json.loads(payload)
+    assert obj["direction"] == "llm_to_mcp"
+    assert obj["tool_name"] == "search_documents"
+    assert obj["arguments"]["query"] == "会议纪要"
+    assert obj["elapsed_ms"] == 321.5
 
 
 async def test_play_audio_file_missing_returns_friendly_error(monkeypatch) -> None:

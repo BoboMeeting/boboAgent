@@ -1,9 +1,13 @@
 import asyncio
+import functools
 import io
+import json
 import logging
 import os
 import textwrap
+import time
 import wave
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -33,6 +37,229 @@ except ImportError:
 
 logger = logging.getLogger("agent")
 load_dotenv(".env.local")
+
+
+def _iso_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def summarize_tool_event(
+    *,
+    direction: str,
+    tool_name: str,
+    arguments: dict | None = None,
+    result: object | None = None,
+    elapsed_ms: float | None = None,
+    status: str | None = None,
+    error: str | None = None,
+) -> str:
+    payload = {
+        "ts": _iso_timestamp(),
+        "direction": direction,
+        "tool_name": tool_name,
+        "arguments": arguments or {},
+        "result": result,
+        "elapsed_ms": elapsed_ms,
+        "status": status,
+        "error": error,
+    }
+    return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def log_tool_event(
+    *,
+    direction: str,
+    tool_name: str,
+    arguments: dict | None = None,
+    result: object | None = None,
+    elapsed_ms: float | None = None,
+    status: str | None = None,
+    error: str | None = None,
+) -> None:
+    logger.info(
+        "AGENT_TOOL_TRACE %s",
+        summarize_tool_event(
+            direction=direction,
+            tool_name=tool_name,
+            arguments=arguments,
+            result=result,
+            elapsed_ms=elapsed_ms,
+            status=status,
+            error=error,
+        ),
+    )
+
+
+def _install_livekit_tool_trace_logging() -> None:
+    """Wrap LiveKit's MCP tool call and return path so each handoff is timestamped."""
+    try:
+        from livekit.agents import llm as livekit_llm
+        from livekit.agents.llm import mcp as livekit_mcp
+        from livekit.agents.voice import agent_activity
+    except Exception:
+        return
+
+    original_make_function_tool = livekit_mcp.MCPServer._make_function_tool
+
+    def _patched_make_function_tool(self, name, description, input_schema, meta, *, options):
+        async def _resolve(tool_result, raw_arguments):
+            if tool_result.isError:
+                error_parts = [
+                    part.text if hasattr(part, "text") else str(part)
+                    for part in tool_result.content
+                ]
+                log_tool_event(
+                    direction="mcp_to_agent",
+                    tool_name=name,
+                    arguments=raw_arguments,
+                    result=error_parts,
+                    status="error",
+                    error="\n".join(error_parts),
+                )
+                raise livekit_llm.ToolError("\n".join(error_parts))
+
+            result_payload = (
+                tool_result.model_dump() if hasattr(tool_result, "model_dump") else str(tool_result)
+            )
+            log_tool_event(
+                direction="mcp_to_agent",
+                tool_name=name,
+                arguments=raw_arguments,
+                result=result_payload,
+                status="received",
+            )
+            ctx = livekit_mcp.MCPToolResultContext(
+                tool_name=name,
+                arguments=raw_arguments,
+                result=tool_result,
+            )
+            resolved = self._tool_result_resolver(ctx)
+            if asyncio.iscoroutine(resolved):
+                resolved = await resolved
+            log_tool_event(
+                direction="mcp_to_agent",
+                tool_name=name,
+                arguments=raw_arguments,
+                result=resolved,
+                elapsed_ms=0.0,
+                status="resolved",
+            )
+            return resolved
+
+        async def _tool_called(raw_arguments):
+            call_started = time.perf_counter()
+            log_tool_event(
+                direction="llm_to_mcp",
+                tool_name=name,
+                arguments=raw_arguments,
+                status="started",
+            )
+            try:
+                if self._client is None:
+                    raise livekit_llm.ToolError(
+                        "Tool invocation failed: internal service is unavailable. "
+                        "Please check that the MCPServer is still running."
+                    )
+                tool_result = await self._client.call_tool(name, raw_arguments)
+                return await _resolve(tool_result, raw_arguments)
+            finally:
+                log_tool_event(
+                    direction="llm_to_mcp",
+                    tool_name=name,
+                    arguments=raw_arguments,
+                    elapsed_ms=(time.perf_counter() - call_started) * 1000,
+                    status="finished",
+                )
+
+        raw_schema = {
+            "name": name,
+            "description": description,
+            "parameters": input_schema,
+        }
+        if meta:
+            raw_schema["meta"] = meta
+
+        return livekit_llm.function_tool(
+            _tool_called,
+            raw_schema=raw_schema,
+            flags=options["flags"],
+            on_duplicate=options["on_duplicate"],
+            duplicate_scope=options["duplicate_scope"],
+        )
+
+    if not getattr(livekit_mcp.MCPServer._make_function_tool, "_agent_trace_patched", False):
+        livekit_mcp.MCPServer._make_function_tool = _patched_make_function_tool
+        livekit_mcp.MCPServer._make_function_tool._agent_trace_patched = True
+
+    original_schedule_speech = agent_activity.AgentActivity._schedule_speech
+    original_pipeline_reply = agent_activity.AgentActivity._pipeline_reply_task
+    original_realtime_reply = agent_activity.AgentActivity._realtime_reply_task
+
+    def _patched_schedule_speech(self, speech_handle, priority, *, force=False):
+        log_tool_event(
+            direction="agent_to_llm",
+            tool_name="tool_result_reply",
+            arguments={
+                "speech_id": str(getattr(speech_handle, "id", "unknown")),
+                "priority": str(priority),
+                "force": force,
+            },
+            status="scheduled",
+        )
+        return original_schedule_speech(self, speech_handle, priority, force=force)
+
+    async def _patched_pipeline_reply(self, *args, **kwargs):
+        started = time.perf_counter()
+        log_tool_event(
+            direction="agent_to_llm",
+            tool_name="tool_result_reply",
+            arguments={"task": "pipeline_reply"},
+            status="started",
+        )
+        try:
+            return await original_pipeline_reply(self, *args, **kwargs)
+        finally:
+            log_tool_event(
+                direction="agent_to_llm",
+                tool_name="tool_result_reply",
+                arguments={"task": "pipeline_reply"},
+                elapsed_ms=(time.perf_counter() - started) * 1000,
+                status="finished",
+            )
+
+    async def _patched_realtime_reply(self, *args, **kwargs):
+        started = time.perf_counter()
+        log_tool_event(
+            direction="agent_to_llm",
+            tool_name="tool_result_reply",
+            arguments={"task": "realtime_reply"},
+            status="started",
+        )
+        try:
+            return await original_realtime_reply(self, *args, **kwargs)
+        finally:
+            log_tool_event(
+                direction="agent_to_llm",
+                tool_name="tool_result_reply",
+                arguments={"task": "realtime_reply"},
+                elapsed_ms=(time.perf_counter() - started) * 1000,
+                status="finished",
+            )
+
+    if not getattr(agent_activity.AgentActivity._schedule_speech, "_agent_trace_patched", False):
+        agent_activity.AgentActivity._schedule_speech = _patched_schedule_speech
+        agent_activity.AgentActivity._schedule_speech._agent_trace_patched = True
+
+    if not getattr(agent_activity.AgentActivity._pipeline_reply_task, "_agent_trace_patched", False):
+        agent_activity.AgentActivity._pipeline_reply_task = _patched_pipeline_reply
+        agent_activity.AgentActivity._pipeline_reply_task._agent_trace_patched = True
+
+    if not getattr(agent_activity.AgentActivity._realtime_reply_task, "_agent_trace_patched", False):
+        agent_activity.AgentActivity._realtime_reply_task = _patched_realtime_reply
+        agent_activity.AgentActivity._realtime_reply_task._agent_trace_patched = True
+
+
+_install_livekit_tool_trace_logging()
 
 # 硅基流动 SiliconFlow：一个 API Key 同时提供 LLM / STT / TTS，OpenAI 兼容接口
 SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
