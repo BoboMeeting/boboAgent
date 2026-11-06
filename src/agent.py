@@ -334,9 +334,10 @@ class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
             # LLM 走硅基流动（OpenAI 兼容接口）
-            # 选用非思考模型 Qwen2.5-7B-Instruct：Qwen3 的思考链会让语音回复延迟十几到几十秒
+            # 选用非思考模型 Qwen2.5-32B-Instruct：Qwen3 的思考链会让语音回复延迟十几到几十秒
+            # 7B 会忽略强制检索指令，32B 经代理实测 3/3 触发 search_knowledge
             llm=openai.LLM(
-                model="Qwen/Qwen2.5-7B-Instruct",
+                model="Qwen/Qwen2.5-32B-Instruct",
                 base_url=LLMProxy_BASE_URL,
                 api_key=LLMProxy_API_KEY,
             ),
@@ -351,6 +352,12 @@ class Assistant(Agent):
             instructions=textwrap.dedent(
                 """\
                 You are a friendly, reliable voice assistant that answers questions, explains topics, and completes tasks with available tools.
+
+                # Search first
+
+                For ANY factual question (product specs, hardware details, usage questions, internal documents, rules, processes, or product materials), call the search_knowledge tool FIRST, even for short or incomplete queries, and even if you think you know the answer. Never ask a clarifying question before calling it. Answer based on the returned snippets.
+                If search_knowledge returns no relevant snippets, briefly say the knowledge base has no related information, then answer from your general knowledge.
+
                 If asked to play audio, call the `play_audio_file` function immediately. It plays a fixed built-in clip and needs no file name, so do not ask the user for one.
                 # Output rules
 
@@ -365,14 +372,14 @@ class Assistant(Agent):
 
                 # Conversational flow
 
-                - Help the user accomplish their objective efficiently and correctly. Prefer the simplest safe step first. Check understanding and adapt.
+                - Help the user accomplish their objective efficiently and correctly. Prefer the simplest safe step first.
                 - Provide guidance in small steps and confirm completion before continuing.
                 - Summarize key results when closing a topic.
 
                 # Tools
 
                 - Use available tools as needed, or upon user request.
-                - Collect required inputs first. Perform actions silently if the runtime expects it.
+                - Perform actions silently if the runtime expects it.
                 - Speak outcomes clearly. If an action fails, say so once, propose a fallback, or ask how to proceed.
                 - When tools return structured data, summarize it to the user in a way that is easy to understand, and don't directly recite identifiers or other technical details.
                 
@@ -387,7 +394,7 @@ class Assistant(Agent):
                 MCPToolset(
                     id="my-mcp-server",
                     mcp_server=MCPServerHTTP(
-                        "http://192.168.1.51:5103/mcp",
+                        "http://192.168.1.51:5080/mcp",
                     ),
                 )
             ],
@@ -451,7 +458,7 @@ server = AgentServer()
 
 
 @server.rtc_session(agent_name="my-agent")
-async def my_agent(ctx: JobContext):
+async def entrypoint(ctx: JobContext):
     # Logging setup
     # Add any other context you want in all log entries here
     ctx.log_context_fields = {
